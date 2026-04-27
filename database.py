@@ -5,9 +5,14 @@ from langchain_chroma import Chroma
 from langchain_core.tools import tool
 from config import embeddings, PDF_PATH, PERSIST_DIRECTORY, COLLECTION_NAME
 
-# === 新增的进阶检索导入 ===
+# === 基础检索导入 ===
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
+
+# === 重排序导入 ===
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+from langchain_classic.retrievers import ContextualCompressionRetriever
 
 
 def load_and_split_pdf():
@@ -43,18 +48,29 @@ docs = load_and_split_pdf()
 vectorstore = setup_vectorstore(docs)
 
 # [1. 语义检索器]
-# 召回数量 k 调大到 10，保证不会漏掉有用的信息
 vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
 
 # [2. 关键词检索器]
 print("正在构建 BM25 关键词索引...")
 bm25_retriever = BM25Retriever.from_documents(docs)
-bm25_retriever.k = 10  # 同样召回 10 个
+bm25_retriever.k = 10
 
 # [3. 混合检索器]
-# 将向量(50%)和关键词(50%)组合，它们会各自找出 10 个文档，然后进行排名融合
 ensemble_retriever = EnsembleRetriever(
     retrievers=[bm25_retriever, vector_retriever], weights=[0.5, 0.5]
+)
+
+# [4. 终极重排序器 (Reranker) ]
+print("正在加载 BGE 重排模型")
+# 实例化交叉编码器模型
+model = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-base")
+# 设置重排规则：从混合检索捞出来的 20 个文档中，精选出得分最高的 Top 3
+compressor = CrossEncoderReranker(model=model, top_n=3)
+
+# [5. 组装终极检索器]
+# 用压缩器包住混合检索器
+compression_retriever = ContextualCompressionRetriever(
+    base_compressor=compressor, base_retriever=ensemble_retriever
 )
 
 
@@ -63,16 +79,21 @@ def retriever_tool(query: str) -> str:
     """
     This tool searches and returns the information from the Stock Market Performance 2024 document.
     """
-    print(f"\n🔍 [检索系统] 正在使用混合检索搜索关键词: '{query}'...")
+    print(f"\n🔍 [检索系统] 正在使用 混合检索+重排 搜索关键词: '{query}'...")
 
-    # 直接使用混合检索器
-    docs = ensemble_retriever.invoke(query)
+    # 使用组装好的终极重排检索器
+    docs = compression_retriever.invoke(query)
 
     if not docs:
         return "I found no relevant information in the Stock Market Performance 2024 document."
 
     results = []
+    # 打印出重排后的结果和相关性得分
     for i, doc in enumerate(docs):
+        # 别猜键名了，直接打印它所有的 metadata 看看里面有什么！
+        print(f"🎯 [Debug] 文档 {i+1} 的元数据: {doc.metadata}")
+        score = doc.metadata.get("relevance_score", "未找到分数")
+        print(f"🎯 选中文档 {i+1} | 相关度评分: {score}")
         results.append(f"Document {i+1}:\n{doc.page_content}")
 
     return "\n\n".join(results)
