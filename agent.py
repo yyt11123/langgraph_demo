@@ -1,3 +1,5 @@
+import re
+import os
 import operator
 from typing import TypedDict, Annotated, Sequence, Literal
 from pydantic import BaseModel
@@ -15,13 +17,15 @@ from database import tools, tools_dict
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     optimized_queries: dict
-    next_node: str  # 记录 Supervisor 决定的下一个节点
+    # 多 Agent 的关键 用来记录 Supervisor 决定的下一个接手任务的员工名字
+    next_node: str
 
 
 class RouteInfo(BaseModel):
     """Supervisor 的路由输出结构"""
 
-    next_node: Literal["Researcher", "Analyst", "FINISH"]
+    # 返回的 JSON 里必须且只能包含这三个词中的一个
+    next_node: Literal["Researcher", "Analyst", "Visualizer", "FINISH"]
 
 
 # 绑定带有强制结构化输出的 Supervisor
@@ -74,6 +78,12 @@ def analyst_node(state: AgentState) -> dict:
     system_prompt = """你是一名资深的金融分析师。
     请根据对话历史中 Researcher 提供的搜索结果，给出专业、结构化的分析报告或回答。
     请务必使用清晰的排版（如加粗、列表、表格），让金融数据一目了然且易于阅读。
+    
+    【极其重要的纪律要求】：
+    你的职责仅限于文字和表格总结！
+    就算用户在问题里明确要求了“画图”、“写代码”或“可视化”，你也绝对不允许写任何 Python 代码！
+    如果有画图需求，请在你的总结结尾加上一句话：“数据总结完毕，接下来请 Visualizer 专家为您生成图表。”
+    绝对不要输出 ```python 代码块！
     """
     messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
 
@@ -147,6 +157,39 @@ def researcher_router(state: AgentState):
     return "Supervisor"
 
 
+def visualizer_node(state: AgentState) -> dict:
+    """可视化节点：根据对话历史写代码，并在本地自动生成图表图片"""
+    system_prompt = """你是一个高级数据可视化专家。
+    请阅读对话历史中 Analyst 提供的数据总结，编写完整的 Python 代码（使用 matplotlib）来生成图表（如柱状图或折线图）。
+    
+    【强制要求】：
+    1. 代码必须是完整的，包含 import、数据定义和画图逻辑。
+    2. 解决中文显示问题（plt.rcParams['font.sans-serif'] = ['SimHei']）。
+    3. 在代码最后必须使用 `plt.savefig('stock_chart.png')` 将图片保存到当前目录，千万不要使用 `plt.show()` 以免阻塞终端！
+    4. 你的回复只能包含 markdown 的 ```python 代码块 ```，不要有任何多余的废话。
+    """
+    messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
+    print("📊 [Visualizer] 正在分析数据并编写画图代码...")
+    response = llm.invoke(messages)
+
+    # —— 魔法环节：自动提取代码并运行 ——
+    code_match = re.search(r"```python\n(.*?)\n```", response.content, re.DOTALL)
+    if code_match:
+        code = code_match.group(1)
+        try:
+            # 将大模型写的代码存为本地临时文件
+            with open("generate_chart_temp.py", "w", encoding="utf-8") as f:
+                f.write(code)
+            # 在后台运行这段代码
+            print("⚙️ [Visualizer] 正在后台渲染图表...")
+            os.system("python generate_chart_temp.py")
+            print("✨ [Visualizer] 图表生成完毕！请在左侧目录查看 'stock_chart.png' 🖼️")
+        except Exception as e:
+            print(f"⚠️ [Visualizer] 图表渲染遇到小问题: {e}")
+
+    return {"messages": [response]}
+
+
 # ================= 5. 构建多 Agent 协作图 =================
 
 
@@ -159,6 +202,7 @@ def create_multi_agent_graph():
     graph.add_node("Analyst", analyst_node)
     graph.add_node("rewrite", rewrite_node)
     graph.add_node("retriever_agent", retriever_action)
+    graph.add_node("Visualizer", visualizer_node)
 
     # 设置起点为主管
     graph.set_entry_point("Supervisor")
@@ -167,7 +211,12 @@ def create_multi_agent_graph():
     graph.add_conditional_edges(
         "Supervisor",
         lambda x: x["next_node"],
-        {"Researcher": "Researcher", "Analyst": "Analyst", "FINISH": END},
+        {
+            "Researcher": "Researcher",
+            "Analyst": "Analyst",
+            "Visualizer": "Visualizer",
+            "FINISH": END,
+        },
     )
 
     # Researcher 的动作循环
@@ -179,6 +228,8 @@ def create_multi_agent_graph():
 
     # Analyst 写完报告后，交回给 Supervisor 判断是否可以结束
     graph.add_edge("Analyst", "Supervisor")
+    # 图表专家画完图后，交回给 Supervisor 判断是否可以结束
+    graph.add_edge("Visualizer", "Supervisor")
 
     # 编译图并绑定记忆
     return graph.compile(checkpointer=memory)
